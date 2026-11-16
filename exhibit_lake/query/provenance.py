@@ -29,6 +29,10 @@ class Provenance:
             return {"event": event, "raw": json.loads(raw["payload_json"]),
                     "raw_hash": raw["payload_hash"], "batch": batch,
                     "contract": {**contract, "fields": json.loads(contract.pop("fields_json"))},
+                    "reception": {"received_at": batch["received_at"], "request_key": batch["request_key"],
+                                  "held": bool(event["held_by_freeze"]),
+                                  "held_at": event["held_at"], "held_reason": event["held_reason"],
+                                  "released_at": event["released_at"], "late": bool(event["late"])},
                     "snapshots": publications}
 
     def batch(self, batch_id: str) -> dict:

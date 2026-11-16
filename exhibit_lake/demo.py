@@ -27,7 +27,26 @@ def main() -> None:
         result = lake.analytics.day("showroom", "2026-03-01")
         assert result["total_visitors"] == 12 and result["total_feedback"] == 1
         assert lake.snapshots.verify(publication["snapshot_id"])["valid"]
-        print(json.dumps({"publication": publication["snapshot_id"], "report": result}, ensure_ascii=False))
+
+        closure = lake.close_day("showroom", "2026-03-01", closed_by="demo-ops",
+                                 reason="daily-report-delivered", request_key="demo-close")
+        late = lake.ingest("counter", "count-v1", "batch-3", [{"event_id": "v2", "exhibit_id": "robot",
+                            "event_at": "2026-03-01T18:00:00+08:00", "count": 4}])
+        assert late["held_rows"] == 1
+        frozen = lake.analytics.day("showroom", "2026-03-01")
+        assert frozen["snapshot_id"] == publication["snapshot_id"] and frozen["total_visitors"] == 12
+
+        reopened = lake.reopen_day("showroom", "2026-03-01", approved_by="venue-lead",
+                                   reason="late-device-batch", request_key="demo-reopen")
+        backfill = lake.publish_day("showroom", "2026-03-01", publication["snapshot_id"])
+        assert backfill["generation"] == 2
+        assert lake.analytics.day("showroom", "2026-03-01")["total_visitors"] == 16
+        assert lake.analytics.day("showroom", "2026-03-01", publication["snapshot_id"])["total_visitors"] == 12
+        print(json.dumps({"publication": publication["snapshot_id"],
+                          "closure_version": reopened["closure_version"],
+                          "backfill": backfill["snapshot_id"],
+                          "frozen_report": frozen, "report": lake.analytics.day("showroom", "2026-03-01")},
+                         ensure_ascii=False))
 
 
 if __name__ == "__main__":

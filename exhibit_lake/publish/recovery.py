@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from exhibit_lake.catalog.registry import iso_day, now
 from exhibit_lake.catalog.store import Store
-from exhibit_lake.errors import NotFound, StateError
+from exhibit_lake.errors import InvalidInput, NotFound, StateError
+from exhibit_lake.publish import day_state
 from exhibit_lake.publish.snapshots import Snapshots
 
 
@@ -12,20 +13,29 @@ class Recovery:
         self.store = store
         self.snapshots = snapshots
 
-    def inspect(self, venue_id: str, day: str) -> dict:
+    def inspect(self, venue_id: str, day: str, *, offset: int = 0, limit: int = 100) -> dict:
         iso_day(day, "local_day")
+        if offset < 0 or not 1 <= limit <= 500:
+            raise InvalidInput("invalid recovery page")
         with self.store.transaction(write=False) as conn:
             if not Store.one(conn, "SELECT venue_id FROM venues WHERE venue_id=?", (venue_id,)):
                 raise NotFound("venue not found")
             part = Store.one(conn, "SELECT * FROM partitions WHERE venue_id=? AND local_day=?", (venue_id, day))
             staged = Store.many(conn, "SELECT snapshot_id,parent_id,generation,digest,created_at FROM snapshots "
-                                "WHERE venue_id=? AND local_day=? AND status='staged' ORDER BY created_at", (venue_id, day))
+                                "WHERE venue_id=? AND local_day=? AND status='staged' "
+                                "ORDER BY created_at LIMIT ? OFFSET ?", (venue_id, day, limit, offset))
             abandoned = Store.many(conn, "SELECT snapshot_id,parent_id,generation,created_at FROM snapshots "
-                                   "WHERE venue_id=? AND local_day=? AND status='abandoned' ORDER BY created_at", (venue_id, day))
+                                   "WHERE venue_id=? AND local_day=? AND status='abandoned' "
+                                   "ORDER BY created_at LIMIT ? OFFSET ?", (venue_id, day, limit, offset))
             head = part["head_id"] if part else None
+            state = day_state.read_state(conn, venue_id, day)
             return {"venue_id": venue_id, "local_day": day, "head_id": head,
                     "generation": part["generation"] if part else 0,
-                    "candidates": [{**item, "publishable": item["parent_id"] == head and
+                    "closed": state["closed"], "closure_version": state["closure_version"],
+                    "watermark_event_at": state["watermark_event_at"],
+                    "held_events": state["held_events"],
+                    "candidates": [{**item, "publishable": not state["closed"] and
+                                    item["parent_id"] == head and
                                     item["generation"] == (part["generation"] if part else 0) + 1}
                                    for item in staged], "abandoned": abandoned}
 
@@ -41,6 +51,9 @@ class Recovery:
                                 "WHERE venue_id=? AND local_day=? AND status='staged'", (venue_id, day))
             stale = [row["snapshot_id"] for row in staged if row["parent_id"] != head or
                      row["generation"] != generation + 1]
+            if stale and part and part["closed"]:
+                raise StateError("day is closed; staged candidates are preserved for audit",
+                                 details={"closure_version": part["closure_version"], "head_id": head})
             for snapshot_id in stale:
                 conn.execute("UPDATE snapshots SET status='abandoned' WHERE snapshot_id=?", (snapshot_id,))
                 Store.audit(conn, "snapshot.abandoned_stale", snapshot_id,
@@ -57,6 +70,7 @@ class Recovery:
                              (snapshot["venue_id"], snapshot["local_day"]))
             current_head = part["head_id"] if part else None
             current_generation = part["generation"] if part else 0
+            state = day_state.read_state(conn, snapshot["venue_id"], snapshot["local_day"])
             membership = Store.one(conn, "SELECT COUNT(*) AS n FROM snapshot_members WHERE snapshot_id=?",
                                    (snapshot_id,))["n"]
             return {"snapshot_id": snapshot_id, "status": snapshot["status"],
@@ -64,5 +78,6 @@ class Recovery:
                     "generation": snapshot["generation"], "current_generation": current_generation,
                     "members": membership, "head_matches": snapshot["parent_id"] == current_head,
                     "generation_matches": snapshot["generation"] == current_generation + 1,
-                    "publishable": snapshot["status"] == "staged" and
+                    "closed": state["closed"], "closure_version": state["closure_version"],
+                    "publishable": snapshot["status"] == "staged" and not state["closed"] and
                     snapshot["parent_id"] == current_head and snapshot["generation"] == current_generation + 1}

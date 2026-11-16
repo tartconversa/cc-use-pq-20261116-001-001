@@ -75,6 +75,21 @@ class Audit:
                         issues.append({"local_day": part["local_day"], "code": "head_partition_mismatch"})
                 elif part["generation"] != 0:
                     issues.append({"local_day": part["local_day"], "code": "orphan_generation"})
+                latest = Store.one(conn, "SELECT * FROM day_closures WHERE venue_id=? AND local_day=? "
+                                   "ORDER BY version DESC LIMIT 1", (venue_id, part["local_day"]))
+                if bool(part["closed"]) != bool(latest and latest["status"] == "closed"):
+                    issues.append({"local_day": part["local_day"], "code": "closure_state_mismatch"})
+                if part["closed"] and latest and latest["snapshot_id"] != part["head_id"]:
+                    issues.append({"local_day": part["local_day"], "code": "closure_head_mismatch"})
+                if latest is None and part["closure_version"] != 0:
+                    issues.append({"local_day": part["local_day"], "code": "closure_history_missing"})
+                held_overlap = Store.one(conn, "SELECT COUNT(*) AS n FROM accepted_events e "
+                                          "JOIN snapshot_members m ON m.source_id=e.source_id "
+                                          "AND m.event_id=e.event_id AND m.snapshot_id=? "
+                                          "WHERE e.venue_id=? AND e.local_day=? AND e.held_by_freeze=1",
+                                          (part["head_id"] or "", venue_id, part["local_day"]))["n"]
+                if held_overlap:
+                    issues.append({"local_day": part["local_day"], "code": "held_event_published"})
             batches = Store.many(conn, "SELECT b.batch_id FROM batches b JOIN sources s ON s.source_id=b.source_id "
                                  "WHERE s.venue_id=? ORDER BY b.batch_id", (venue_id,))
         damaged = [self.batch_integrity(x["batch_id"]) for x in batches]

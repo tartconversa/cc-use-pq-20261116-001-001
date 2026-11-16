@@ -15,13 +15,13 @@ class Exports:
     def daily_csv(self, venue_id: str, day: str, snapshot_id: str | None = None) -> str:
         report = self.analytics.day(venue_id, day, snapshot_id)
         output = io.StringIO()
-        fields = ["venue_id", "local_day", "snapshot_id", "generation", "exhibit_id", "name", "maker",
+        fields = ["venue_id", "local_day", "snapshot_id", "generation", "closed", "exhibit_id", "name", "maker",
                   "visit_events", "visitors", "feedback_events", "unique_feedback_visitors",
                   "rating_average", "demo_events", "demo_seconds", "channels"]
         writer = csv.DictWriter(output, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         for exhibit in report["exhibits"]:
-            row = {**{name: report[name] for name in fields[:4]}, **exhibit}
+            row = {**{name: report[name] for name in fields[:5]}, **exhibit}
             row["channels"] = json.dumps(row["channels"], sort_keys=True)
             writer.writerow({name: row.get(name) for name in fields})
         return output.getvalue()

@@ -6,6 +6,7 @@ import json
 from exhibit_lake.catalog.registry import iso_day
 from exhibit_lake.catalog.store import Store
 from exhibit_lake.errors import NotFound
+from exhibit_lake.publish import day_state
 
 
 class Quality:
@@ -50,10 +51,14 @@ class Quality:
                                      "FROM sources s LEFT JOIN contracts c ON c.source_id=s.source_id "
                                      "WHERE s.venue_id=? GROUP BY s.source_id,s.kind,s.active ORDER BY s.source_id", (venue_id,))
             pending = Store.one(conn, "SELECT COUNT(*) AS n FROM accepted_events e WHERE e.venue_id=? AND e.local_day=? "
-                                "AND e.published_at IS NULL", (venue_id, day))["n"]
+                                "AND e.held_by_freeze=0 AND e.published_at IS NULL", (venue_id, day))["n"]
+            state = day_state.read_state(conn, venue_id, day)
             rejected = Store.many(conn, "SELECT r.code,COUNT(*) AS n FROM rejected_rows r JOIN batches b ON b.batch_id=r.batch_id "
                                   "JOIN sources s ON s.source_id=b.source_id WHERE s.venue_id=? AND substr(b.received_at,1,10)=? "
                                   "GROUP BY r.code ORDER BY r.code", (venue_id, day))
             return {"venue_id": venue_id, "local_day": day, "exhibits_available": len(available),
                     "available_exhibit_ids": [x["exhibit_id"] for x in available],
+                    "closed": state["closed"], "closure_version": state["closure_version"],
+                    "watermark_event_at": state["watermark_event_at"],
+                    "held_events": state["held_events"],
                     "pending_events": pending, "sources": source_rows, "rejected_by_receive_day": rejected}

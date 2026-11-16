@@ -1,12 +1,14 @@
 """基于隔离快照统计访客流量与展品体验。"""
 from __future__ import annotations
 
+import json
 import statistics
 from collections import defaultdict
 
 from exhibit_lake.catalog.registry import iso_day
 from exhibit_lake.catalog.store import Store
 from exhibit_lake.errors import InvalidInput, NotFound, StateError
+from exhibit_lake.publish import day_state
 from exhibit_lake.publish.snapshots import Snapshots
 
 
@@ -30,6 +32,11 @@ class Analytics:
         if snapshot["status"] != "published":
             raise StateError("snapshot is not published")
         return snapshot
+
+    @staticmethod
+    def _closure_history(conn, venue_id: str, day: str) -> list[dict]:
+        return Store.many(conn, "SELECT version,snapshot_id,status,closed_at FROM day_closures "
+                          "WHERE venue_id=? AND local_day=? ORDER BY version", (venue_id, day))
 
     def _records(self, conn, snapshot_id: str, kind: str | None = None) -> list[dict]:
         sql = "SELECT e.event_id,e.source_id,e.exhibit_id,e.event_at,e.local_day,e.kind,e.value_num,e.category,e.visitor_hash "
@@ -75,8 +82,19 @@ class Analytics:
                                "rating_average": round(group["rating_sum"] / feedback, 4) if feedback else None,
                                "demo_events": group["demo_events"], "demo_seconds": round(group["demo_seconds"], 3),
                                "channels": dict(sorted(group["channels"].items()))})
+            state = day_state.read_state(conn, venue_id, day)
+            manifest = json.loads(snapshot["manifest_json"])
+            freeze = next((x for x in self._closure_history(conn, venue_id, day)
+                           if x["snapshot_id"] == snapshot["snapshot_id"]), None)
             return {"venue_id": venue_id, "local_day": day, "snapshot_id": snapshot["snapshot_id"],
-                    "generation": snapshot["generation"], "event_count": len(records), "exhibits": result,
+                    "generation": snapshot["generation"], "event_count": len(records),
+                    "closed": freeze is not None,
+                    "frozen_version": freeze["version"] if freeze else None,
+                    "frozen_at": freeze["closed_at"] if freeze else None,
+                    "superseded": state["head_id"] != snapshot["snapshot_id"],
+                    "staged_closure_version": manifest.get("closure_version"),
+                    "watermark_event_at": manifest.get("watermark_event_at"),
+                    "held_events": state["held_events"], "exhibits": result,
                     "total_visitors": sum(x["visitors"] for x in result),
                     "total_feedback": sum(x["feedback_events"] for x in result),
                     "total_demos": sum(x["demo_events"] for x in result)}
@@ -118,12 +136,16 @@ class Analytics:
                 raise NotFound("venue not found")
             heads = Store.many(conn, "SELECT local_day,head_id,generation FROM partitions WHERE venue_id=? AND local_day BETWEEN ? AND ? "
                                "AND head_id IS NOT NULL ORDER BY local_day", (venue_id, start_day, end_day))
+            closed_days = {x["local_day"] for x in Store.many(
+                conn, "SELECT local_day FROM partitions WHERE venue_id=? AND local_day BETWEEN ? AND ? "
+                "AND closed=1", (venue_id, start_day, end_day))}
             rows = []
             for head in heads:
                 events = self._records(conn, head["head_id"])
                 ratings = [x["value_num"] for x in events if x["kind"] == "feedback"]
                 rows.append({"local_day": head["local_day"], "snapshot_id": head["head_id"],
                              "generation": head["generation"], "events": len(events),
+                             "closed": head["local_day"] in closed_days,
                              "visitors": sum(int(x["value_num"]) for x in events if x["kind"] == "visit"),
                              "feedback": len(ratings), "rating_average": round(statistics.mean(ratings), 4) if ratings else None,
                              "demos": sum(x["kind"] == "demo" for x in events)})

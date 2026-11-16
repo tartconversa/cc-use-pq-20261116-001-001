@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS batches (
     request_key TEXT NOT NULL, payload_hash TEXT NOT NULL, contract_id TEXT NOT NULL REFERENCES contracts(contract_id),
     status TEXT NOT NULL, received_at TEXT NOT NULL, committed_at TEXT,
     total_rows INTEGER NOT NULL, valid_rows INTEGER NOT NULL, rejected_rows INTEGER NOT NULL,
+    held_rows INTEGER NOT NULL DEFAULT 0,
     UNIQUE(source_id, request_key)
 );
 CREATE TABLE IF NOT EXISTS raw_rows (
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS accepted_events (
     venue_id TEXT NOT NULL, exhibit_id TEXT NOT NULL, event_at TEXT NOT NULL,
     local_day TEXT NOT NULL, kind TEXT NOT NULL, value_num REAL, category TEXT,
     visitor_hash TEXT, payload_hash TEXT NOT NULL, published_at TEXT,
+    late INTEGER NOT NULL DEFAULT 0, held_by_freeze INTEGER NOT NULL DEFAULT 0,
+    held_at TEXT, held_closure_version INTEGER, held_reason TEXT, released_at TEXT,
     PRIMARY KEY(source_id,event_id), UNIQUE(batch_id,row_no)
 );
 CREATE INDEX IF NOT EXISTS ix_events_day ON accepted_events(venue_id,local_day,exhibit_id,kind);
@@ -60,6 +63,8 @@ CREATE TABLE IF NOT EXISTS rejected_rows (
 CREATE TABLE IF NOT EXISTS partitions (
     venue_id TEXT NOT NULL REFERENCES venues(venue_id), local_day TEXT NOT NULL,
     generation INTEGER NOT NULL DEFAULT 0, head_id TEXT,
+    closed INTEGER NOT NULL DEFAULT 0, closure_version INTEGER NOT NULL DEFAULT 0,
+    watermark_event_at TEXT, watermark_received_at TEXT,
     PRIMARY KEY(venue_id, local_day)
 );
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -73,11 +78,46 @@ CREATE TABLE IF NOT EXISTS snapshot_members (
     source_id TEXT NOT NULL, event_id TEXT NOT NULL, payload_hash TEXT NOT NULL,
     PRIMARY KEY(snapshot_id,source_id,event_id)
 );
+CREATE TABLE IF NOT EXISTS day_closures (
+    venue_id TEXT NOT NULL, local_day TEXT NOT NULL, version INTEGER NOT NULL,
+    status TEXT NOT NULL, snapshot_id TEXT, generation INTEGER NOT NULL,
+    watermark_event_at TEXT, watermark_received_at TEXT,
+    closed_at TEXT NOT NULL, closed_by TEXT, close_reason TEXT, close_request_key TEXT,
+    reopened_at TEXT, reopened_by TEXT, approved_by TEXT, reopen_reason TEXT,
+    reopen_request_key TEXT, released_events INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(venue_id, local_day, version)
+);
+CREATE INDEX IF NOT EXISTS ix_closures_day ON day_closures(venue_id, local_day, version DESC);
 CREATE TABLE IF NOT EXISTS audits (
     audit_id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL,
     subject TEXT NOT NULL, detail_json TEXT NOT NULL, at TEXT NOT NULL
 );
 """
+
+# Columns added after the first schema revision.  CREATE TABLE IF NOT EXISTS
+# does not touch databases that already exist, so these are applied in place.
+MIGRATIONS = {
+    "batches": {
+        "held_rows": "ALTER TABLE batches ADD COLUMN held_rows INTEGER NOT NULL DEFAULT 0",
+    },
+    "accepted_events": {
+        "late": "ALTER TABLE accepted_events ADD COLUMN late INTEGER NOT NULL DEFAULT 0",
+        "held_by_freeze": "ALTER TABLE accepted_events ADD COLUMN held_by_freeze INTEGER NOT NULL DEFAULT 0",
+        "held_at": "ALTER TABLE accepted_events ADD COLUMN held_at TEXT",
+        "held_closure_version": "ALTER TABLE accepted_events ADD COLUMN held_closure_version INTEGER",
+        "held_reason": "ALTER TABLE accepted_events ADD COLUMN held_reason TEXT",
+        "released_at": "ALTER TABLE accepted_events ADD COLUMN released_at TEXT",
+    },
+    "day_closures": {
+        "released_events": "ALTER TABLE day_closures ADD COLUMN released_events INTEGER NOT NULL DEFAULT 0",
+    },
+    "partitions": {
+        "closed": "ALTER TABLE partitions ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
+        "closure_version": "ALTER TABLE partitions ADD COLUMN closure_version INTEGER NOT NULL DEFAULT 0",
+        "watermark_event_at": "ALTER TABLE partitions ADD COLUMN watermark_event_at TEXT",
+        "watermark_received_at": "ALTER TABLE partitions ADD COLUMN watermark_received_at TEXT",
+    },
+}
 
 
 class Store:
@@ -87,6 +127,17 @@ class Store:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        for table, columns in MIGRATIONS.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for column, statement in columns.items():
+                if column not in existing:
+                    conn.execute(statement)
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_events_held "
+                     "ON accepted_events(venue_id,local_day,held_by_freeze)")
 
     @contextlib.contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

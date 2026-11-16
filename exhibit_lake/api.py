@@ -52,6 +52,24 @@ class StageIn(BaseModel):
     venue_id: str
     local_day: str
     expected_head: str | None = None
+    expected_closure_version: int | None = None
+
+
+class CloseIn(BaseModel):
+    snapshot_id: str | None = None
+    expected_head: str | None = None
+    expected_closure_version: int | None = None
+    closed_by: str | None = None
+    reason: str | None = None
+    request_key: str | None = None
+
+
+class ReopenIn(BaseModel):
+    approved_by: str
+    reason: str
+    expected_head: str | None = None
+    expected_closure_version: int | None = None
+    request_key: str | None = None
 
 
 class PublishIn(BaseModel):
@@ -128,7 +146,24 @@ def create_app(database: str | None = None) -> FastAPI:
 
     @app.post("/snapshots/stage", status_code=201)
     def stage(data: StageIn):
-        return lake.snapshots.stage(data.venue_id, data.local_day, data.expected_head)
+        return lake.snapshots.stage(data.venue_id, data.local_day, data.expected_head,
+                                    data.expected_closure_version)
+
+    @app.get("/venues/{venue_id}/days/{local_day}/closure")
+    def day_closure(venue_id: str, local_day: str, offset: int = 0, limit: int = 100):
+        return lake.closures.state(venue_id, local_day, offset=offset, limit=limit)
+
+    @app.post("/venues/{venue_id}/days/{local_day}/close")
+    def close_day(venue_id: str, local_day: str, data: CloseIn | None = None):
+        options = data.model_dump() if data is not None else {}
+        return lake.closures.close(venue_id, local_day, **options)
+
+    @app.post("/venues/{venue_id}/days/{local_day}/reopen")
+    def reopen_day(venue_id: str, local_day: str, data: ReopenIn):
+        return lake.closures.reopen(venue_id, local_day, approved_by=data.approved_by,
+                                    reason=data.reason, expected_head=data.expected_head,
+                                    expected_closure_version=data.expected_closure_version,
+                                    request_key=data.request_key)
 
     @app.get("/snapshots/{snapshot_id}")
     def snapshot(snapshot_id: str):
@@ -242,8 +277,8 @@ def create_app(database: str | None = None) -> FastAPI:
         return lake.provenance.batch(batch_id)
 
     @app.get("/venues/{venue_id}/days/{local_day}/recovery")
-    def recovery(venue_id: str, local_day: str):
-        return lake.recovery.inspect(venue_id, local_day)
+    def recovery(venue_id: str, local_day: str, offset: int = 0, limit: int = 100):
+        return lake.recovery.inspect(venue_id, local_day, offset=offset, limit=limit)
 
     @app.post("/venues/{venue_id}/days/{local_day}/abandon-stale")
     def abandon_stale(venue_id: str, local_day: str):

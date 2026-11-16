@@ -5,12 +5,12 @@ import json
 import sqlite3
 import uuid
 from collections import defaultdict
-from datetime import datetime
 
 from exhibit_lake.catalog.registry import iso_day, now
 from exhibit_lake.catalog.store import Store
-from exhibit_lake.errors import Conflict, IntegrityFailure, InvalidInput, NotFound, StateError
+from exhibit_lake.errors import Conflict, IntegrityFailure, NotFound, StateError
 from exhibit_lake.ingest.validation import digest
+from exhibit_lake.publish import day_state
 
 
 def _statistics(events: list[dict]) -> dict:
@@ -35,13 +35,9 @@ class Snapshots:
         self.store = store
 
     def _partition(self, conn: sqlite3.Connection, venue_id: str, day: str) -> dict:
-        part = Store.one(conn, "SELECT * FROM partitions WHERE venue_id=? AND local_day=?", (venue_id, day))
-        if not part:
-            if not Store.one(conn, "SELECT venue_id FROM venues WHERE venue_id=?", (venue_id,)):
-                raise NotFound("venue not found")
-            conn.execute("INSERT INTO partitions(venue_id,local_day,generation,head_id) VALUES(?,?,0,NULL)", (venue_id, day))
-            part = Store.one(conn, "SELECT * FROM partitions WHERE venue_id=? AND local_day=?", (venue_id, day))
-        return part
+        if not Store.one(conn, "SELECT venue_id FROM venues WHERE venue_id=?", (venue_id,)):
+            raise NotFound("venue not found")
+        return day_state.ensure_partition(conn, venue_id, day)
 
     def head(self, venue_id: str, day: str) -> dict:
         iso_day(day, "local_day")
@@ -50,21 +46,41 @@ class Snapshots:
                 raise NotFound("venue not found")
             part = Store.one(conn, "SELECT * FROM partitions WHERE venue_id=? AND local_day=?", (venue_id, day))
             if not part:
-                return {"venue_id": venue_id, "local_day": day, "generation": 0, "head_id": None}
+                return {"venue_id": venue_id, "local_day": day, "generation": 0, "head_id": None,
+                        "closed": False, "closure_version": 0, "watermark_event_at": None,
+                        "watermark_received_at": None}
             return part
 
-    def stage(self, venue_id: str, day: str, expected_head: str | None = None) -> dict:
+    def stage(self, venue_id: str, day: str, expected_head: str | None = None,
+              expected_closure_version: int | None = None) -> dict:
         iso_day(day, "local_day")
         with self.store.transaction() as conn:
             part = self._partition(conn, venue_id, day)
+            if part["closed"]:
+                raise StateError("day is closed; reopen it before staging another version",
+                                 details={"closure_version": part["closure_version"], "head_id": part["head_id"]})
             if part["head_id"] != expected_head:
                 raise Conflict("expected head differs from current partition", details={"head_id": part["head_id"]})
+            if expected_closure_version is not None and part["closure_version"] != expected_closure_version:
+                raise Conflict("closure state changed since expected", details={
+                    "closure_version": part["closure_version"], "closed": bool(part["closed"])})
+            # Events held after a close are reception evidence only.  They can
+            # only reach a report after an authorised reopen, when the release
+            # step clears their hold flag.
             events = Store.many(conn, "SELECT source_id,event_id,exhibit_id,event_at,local_day,kind,value_num,category,visitor_hash,payload_hash "
-                               "FROM accepted_events WHERE venue_id=? AND local_day=? ORDER BY source_id,event_id", (venue_id, day))
+                               "FROM accepted_events WHERE venue_id=? AND local_day=? AND held_by_freeze=0 "
+                               "ORDER BY source_id,event_id", (venue_id, day))
+            # Keep the watermark monotone: a backfilled batch can lower the
+            # maximum event time, but the published cut never moves backwards.
+            prior_watermark = part["watermark_event_at"]
+            observed = max((x["event_at"] for x in events), default=None)
             membership = [{"source_id": x["source_id"], "event_id": x["event_id"], "payload_hash": x["payload_hash"]}
                           for x in events]
+            watermark_event_at = max(filter(None, (prior_watermark, observed)), default=None)
             manifest = {"venue_id": venue_id, "local_day": day, "generation": part["generation"] + 1,
-                        "parent_id": part["head_id"], "members": membership, "statistics": _statistics(events)}
+                        "parent_id": part["head_id"], "members": membership, "statistics": _statistics(events),
+                        "watermark_event_at": watermark_event_at,
+                        "closure_version": part["closure_version"]}
             checksum = digest(manifest)
             duplicate = Store.one(conn, "SELECT snapshot_id FROM snapshots WHERE venue_id=? AND local_day=? AND generation=? AND status='staged'",
                                   (venue_id, day, manifest["generation"]))
@@ -84,10 +100,13 @@ class Snapshots:
         snapshot = Store.one(conn, "SELECT * FROM snapshots WHERE snapshot_id=?", (snapshot_id,))
         if not snapshot:
             raise NotFound("snapshot not found")
+        manifest = json.loads(snapshot["manifest_json"])
         return {"snapshot_id": snapshot_id, "venue_id": snapshot["venue_id"], "local_day": snapshot["local_day"],
                 "generation": snapshot["generation"], "parent_id": snapshot["parent_id"],
                 "status": snapshot["status"], "digest": snapshot["digest"],
-                "manifest": json.loads(snapshot["manifest_json"]), "published_at": snapshot["published_at"]}
+                "manifest": manifest, "published_at": snapshot["published_at"],
+                "watermark_event_at": manifest.get("watermark_event_at"),
+                "closure_version": manifest.get("closure_version")}
 
     def describe(self, snapshot_id: str) -> dict:
         with self.store.transaction(write=False) as conn:
@@ -138,6 +157,10 @@ class Snapshots:
             part = self._partition(conn, snapshot["venue_id"], snapshot["local_day"])
             if snapshot["status"] == "published" and part["head_id"] == snapshot_id:
                 return self._describe(conn, snapshot_id)
+            if part["closed"]:
+                raise StateError("day is closed; reopen it before publishing another version",
+                                 details={"closure_version": part["closure_version"],
+                                          "head_id": part["head_id"]})
             if snapshot["status"] != "staged":
                 raise StateError("only staged snapshots can become head")
             if part["head_id"] != expected_head or snapshot["parent_id"] != expected_head:
@@ -145,8 +168,16 @@ class Snapshots:
             if snapshot["generation"] != part["generation"] + 1:
                 raise Conflict("snapshot generation is stale")
             stamp = now()
-            result = conn.execute("UPDATE partitions SET head_id=?,generation=? WHERE venue_id=? AND local_day=? AND head_id IS ? AND generation=?",
-                                  (snapshot_id, snapshot["generation"], snapshot["venue_id"], snapshot["local_day"],
+            manifest = json.loads(snapshot["manifest_json"])
+            # A staged candidate may predate the current watermark; publishing
+            # must never move the published cut backwards.
+            watermark = max(filter(None, (part["watermark_event_at"],
+                                          manifest.get("watermark_event_at"))), default=None)
+            result = conn.execute("UPDATE partitions SET head_id=?,generation=?,watermark_event_at=?,"
+                                  "watermark_received_at=? WHERE venue_id=? AND local_day=? "
+                                  "AND head_id IS ? AND generation=? AND closed=0",
+                                  (snapshot_id, snapshot["generation"], watermark, stamp,
+                                   snapshot["venue_id"], snapshot["local_day"],
                                    expected_head, part["generation"]))
             if result.rowcount != 1:
                 raise Conflict("concurrent head update")
@@ -164,6 +195,10 @@ class Snapshots:
                 raise NotFound("snapshot not found")
             if snapshot["status"] != "staged":
                 raise StateError("only staged snapshots can be abandoned")
+            part = self._partition(conn, snapshot["venue_id"], snapshot["local_day"])
+            if part["closed"]:
+                raise StateError("day is closed; staged candidates are preserved for audit",
+                                 details={"closure_version": part["closure_version"]})
             conn.execute("UPDATE snapshots SET status='abandoned' WHERE snapshot_id=?", (snapshot_id,))
             Store.audit(conn, "snapshot.abandoned", snapshot_id, {}, now())
             return self._describe(conn, snapshot_id)
@@ -187,7 +222,15 @@ class Snapshots:
                               "FROM accepted_events WHERE venue_id=? AND local_day=? GROUP BY kind ORDER BY kind", (venue_id, day))
             part = Store.one(conn, "SELECT * FROM partitions WHERE venue_id=? AND local_day=?", (venue_id, day))
             unpublished = Store.one(conn, "SELECT COUNT(*) AS n FROM accepted_events e WHERE e.venue_id=? AND e.local_day=? "
-                                    "AND NOT EXISTS(SELECT 1 FROM snapshot_members m WHERE m.snapshot_id=? AND m.source_id=e.source_id AND m.event_id=e.event_id)",
+                                    "AND e.held_by_freeze=0 AND NOT EXISTS(SELECT 1 FROM snapshot_members m "
+                                    "WHERE m.snapshot_id=? AND m.source_id=e.source_id AND m.event_id=e.event_id)",
                                     (venue_id, day, part["head_id"] if part else ""))
+            state = day_state.read_state(conn, venue_id, day)
             return {"venue_id": venue_id, "local_day": day, "head_id": part["head_id"] if part else None,
-                    "generation": part["generation"] if part else 0, "unpublished_events": unpublished["n"], "sources": rows}
+                    "generation": part["generation"] if part else 0,
+                    "unpublished_events": unpublished["n"], "sources": rows,
+                    "closed": state["closed"], "closure_version": state["closure_version"],
+                    "watermark_event_at": state["watermark_event_at"],
+                    "watermark_received_at": state["watermark_received_at"],
+                    "held_events": state["held_events"],
+                    "latest_closure": state["latest_closure"]}

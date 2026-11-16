@@ -36,6 +36,10 @@ class Preview:
             seen = {}
             outcomes = []
             partitions = Counter()
+            closed_days = {row["local_day"] for row in Store.many(
+                conn, "SELECT local_day FROM partitions WHERE venue_id=? AND closed=1",
+                (source["venue_id"],))}
+
             for row_no, row in enumerate(rows, 1):
                 normalized, problem = event(row, contract, source, venue, exhibits)
                 if normalized:
@@ -53,9 +57,12 @@ class Preview:
                     outcomes.append({"row_no": row_no, "accepted": False, **problem})
                 else:
                     partitions[normalized["local_day"]] += 1
+                    held = normalized["local_day"] in closed_days
                     outcomes.append({"row_no": row_no, "accepted": True, "event_id": normalized["event_id"],
-                                     "local_day": normalized["local_day"], "exhibit_id": normalized["exhibit_id"]})
+                                     "local_day": normalized["local_day"], "exhibit_id": normalized["exhibit_id"],
+                                     "held_after_close": held, "held_reason": "day_closed" if held else None})
         return {"source_id": source_id, "contract_id": contract_id, "payload_hash": batch_hash,
                 "total_rows": len(rows), "would_accept": sum(x["accepted"] for x in outcomes),
                 "would_reject": sum(not x["accepted"] for x in outcomes),
+                "would_hold": sum(bool(x.get("held_after_close")) for x in outcomes),
                 "partitions": dict(sorted(partitions.items())), "rows": outcomes}

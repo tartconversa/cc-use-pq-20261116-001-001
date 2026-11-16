@@ -11,6 +11,7 @@ from exhibit_lake.catalog.contracts import Contracts
 from exhibit_lake.ingest.batches import Batches
 from exhibit_lake.ingest.preview import Preview
 from exhibit_lake.publish.snapshots import Snapshots
+from exhibit_lake.publish.closures import Closures
 from exhibit_lake.publish.recovery import Recovery
 from exhibit_lake.query.analytics import Analytics
 from exhibit_lake.query.exports import Exports
@@ -27,6 +28,7 @@ class ExhibitLake:
         self.batches = Batches(self.store)
         self.preview = Preview(self.store)
         self.snapshots = Snapshots(self.store)
+        self.closures = Closures(self.store, self.snapshots)
         self.recovery = Recovery(self.store, self.snapshots)
         self.analytics = Analytics(self.store, self.snapshots)
         self.audit = Audit(self.store)
@@ -58,6 +60,12 @@ class ExhibitLake:
     def publish_day(self, venue_id: str, local_day: str, expected_head: str | None = None) -> dict:
         staged = self.snapshots.stage(venue_id, local_day, expected_head)
         return self.snapshots.publish(staged["snapshot_id"], expected_head)
+
+    def close_day(self, venue_id: str, local_day: str, **options) -> dict:
+        return self.closures.close(venue_id, local_day, **options)
+
+    def reopen_day(self, venue_id: str, local_day: str, **options) -> dict:
+        return self.closures.reopen(venue_id, local_day, **options)
 
     def overview(self, venue_id: str, local_day: str) -> dict:
         return {"head": self.snapshots.head(venue_id, local_day),
